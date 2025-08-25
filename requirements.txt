@@ -1,0 +1,11 @@
+streamlit
+requests
+beautifulsoup4
+selenium
+pytesseract
+Pillow
+webdriver-manager
+streamlit-autorefresh
+psutil
+selenium-wire
+tldextract
