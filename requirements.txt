@@ -1,11 +1,9 @@
 streamlit
+streamlit-autorefresh
 requests
 beautifulsoup4
+lxml
 selenium
-pytesseract
-Pillow
 webdriver-manager
-streamlit-autorefresh
-psutil
-selenium-wire
 tldextract
+psutil

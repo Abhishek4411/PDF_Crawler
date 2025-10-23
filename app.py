@@ -1,5 +1,3 @@
-# app.py
-
 import os
 import subprocess
 import streamlit as st
@@ -12,6 +10,7 @@ from urllib.parse import urlparse
 import random
 import sys
 import atexit
+import signal
 
 # ----------------------------- Streamlit Page Configuration -----------------------------
 
@@ -23,13 +22,8 @@ st.set_page_config(
 
 # ----------------------------- Configuration -----------------------------
 
-# Directory to save downloaded PDFs
 DOWNLOADED_PDFS_DIR = "downloaded_pdfs"
-
-# Log file path
 LOG_FILE = "pdfcrawler.log"
-
-# PID file path
 PID_FILE = "crawler.pid"
 
 # ----------------------------- Initialize Session State -----------------------------
@@ -49,84 +43,158 @@ if 'app_initialized' not in st.session_state:
 # ----------------------------- Helper Functions -----------------------------
 
 def is_crawler_running():
-    """
-    Checks if the crawler subprocess is currently running by reading the PID file.
-    """
     if os.path.exists(PID_FILE):
         try:
             with open(PID_FILE, 'r') as f:
-                pid = int(f.read())
+                pid = int(f.read().strip())
             if psutil.pid_exists(pid):
-                process = psutil.Process(pid)
-                # Ensure the process is indeed the crawler
-                if 'python' in process.name().lower() and 'pdf_crawler.py' in ' '.join(process.cmdline()).lower():
+                p = psutil.Process(pid)
+                # ensure it is our crawler
+                if 'python' in p.name().lower() and any('pdf_crawler.py' in ' '.join(c.cmdline()) for c in [p]):
                     return True
-            # If PID doesn't match, remove the PID file
+            # stale PID file
             os.remove(PID_FILE)
-        except:
+        except Exception:
             if os.path.exists(PID_FILE):
                 os.remove(PID_FILE)
     return False
 
-def start_crawler(url):
+def _kill_process_group(pid: int, timeout: float = 5.0):
+    """Terminate the whole process group (crawler + its children) robustly."""
+    try:
+        if hasattr(os, "getpgid") and hasattr(os, "killpg"):
+            pgid = os.getpgid(pid)
+            # Graceful terminate first
+            os.killpg(pgid, signal.SIGTERM)
+        else:
+            # Windows / no killpg: terminate children via psutil
+            if psutil.pid_exists(pid):
+                proc = psutil.Process(pid)
+                for child in proc.children(recursive=True):
+                    child.terminate()
+                proc.terminate()
+    except Exception:
+        pass
+
+    # wait a bit
+    try:
+        if psutil.pid_exists(pid):
+            proc = psutil.Process(pid)
+            proc.wait(timeout=timeout)
+    except Exception:
+        pass
+
+    # force kill if still alive
+    if psutil.pid_exists(pid):
+        try:
+            if hasattr(os, "getpgid") and hasattr(os, "killpg"):
+                pgid = os.getpgid(pid)
+                os.killpg(pgid, signal.SIGKILL)
+            else:
+                proc = psutil.Process(pid)
+                for child in proc.children(recursive=True):
+                    try:
+                        child.kill()
+                    except Exception:
+                        pass
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+def start_crawler(url, scope, render_mode, max_pages, max_pdfs, delay_s, obey_robots):
     """
-    Starts the PDF crawler as a subprocess and writes its PID to a file.
+    Starts the PDF crawler as a subprocess in its own process group and writes its PID to PID_FILE.
     """
-    # Start the crawler process
+    # Fresh logs and downloads
+    if os.path.exists(LOG_FILE):
+        os.remove(LOG_FILE)
+    if os.path.exists(DOWNLOADED_PDFS_DIR):
+        shutil.rmtree(DOWNLOADED_PDFS_DIR)
+
+    cmd = [
+        sys.executable, 'pdf_crawler.py', url,
+        '--scope', scope,                # 'page' | 'host' | 'domain'
+        '--render', render_mode,         # 'auto' | 'always' | 'never'
+        '--max-pages', str(max_pages),
+        '--max-pdfs', str(max_pdfs),
+        '--delay', str(delay_s),
+    ]
+    cmd += ['--respect-robots' if obey_robots else '--ignore-robots']
+
+    # Start crawler in a NEW SESSION / process group so we can kill the group later.
+    # (Equivalent to setsid; safer than preexec_fn on multithreaded envs.)
+    # Docs: start_new_session parameter. 
+    # https://docs.python.org/3/library/subprocess.html  (Popen)
     process = subprocess.Popen(
-        [sys.executable, 'pdf_crawler.py', url],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        start_new_session=True  # <--- critical
     )
+
     with open(PID_FILE, 'w') as f:
         f.write(str(process.pid))
+
     st.session_state['crawl_count'] += 1
     st.session_state['is_crawling'] = True
     st.sidebar.success(f"Started crawling {url} (PID: {process.pid}).")
+    # immediate UI refresh
+    try:
+        st.rerun()
+    except Exception:
+        st.experimental_rerun()
 
 def stop_crawler():
     """
-    Stops the PDF crawler subprocess by reading the PID file and terminating the process.
+    Stops the PDF crawler subprocess by reading the PID file and terminating the WHOLE PROCESS GROUP.
     """
-    if os.path.exists(PID_FILE):
-        try:
-            with open(PID_FILE, 'r') as f:
-                pid = int(f.read())
-            if psutil.pid_exists(pid):
-                process = psutil.Process(pid)
-                process.terminate()
-                try:
-                    process.wait(timeout=5)
-                    st.sidebar.success("Crawler stopped successfully.")
-                except psutil.TimeoutExpired:
-                    process.kill()
-                    st.sidebar.error("Crawler did not terminate gracefully and was killed.")
-            else:
-                st.sidebar.info("Crawler process not found. It might have already stopped.")
-            os.remove(PID_FILE)
-        except Exception as e:
-            st.sidebar.error(f"Error stopping crawler: {e}")
-            if os.path.exists(PID_FILE):
-                os.remove(PID_FILE)
-        finally:
-            st.session_state['is_crawling'] = False
-    else:
+    if not os.path.exists(PID_FILE):
         st.sidebar.warning("No active crawler to stop.")
+        return
+
+    try:
+        with open(PID_FILE, 'r') as f:
+            pid = int(f.read().strip())
+    except Exception as e:
+        st.sidebar.error(f"Bad PID file: {e}")
+        try:
+            os.remove(PID_FILE)
+        except Exception:
+            pass
+        return
+
+    try:
+        if psutil.pid_exists(pid):
+            _kill_process_group(pid, timeout=5.0)
+            st.sidebar.success("Crawler stopped successfully.")
+        else:
+            st.sidebar.info("Crawler process not found. It may have already stopped.")
+    except Exception as e:
+        st.sidebar.error(f"Error stopping crawler: {e}")
+    finally:
+        if os.path.exists(PID_FILE):
+            try:
+                os.remove(PID_FILE)
+            except Exception:
+                pass
+        st.session_state['is_crawling'] = False
+        # immediate UI refresh
+        try:
+            st.rerun()
+        except Exception:
+            st.experimental_rerun()
 
 def read_log():
-    """
-    Reads the log file and returns its content.
-    """
     if os.path.exists(LOG_FILE):
-        with open(LOG_FILE, 'r') as f:
+        with open(LOG_FILE, 'r', encoding="utf-8", errors="ignore") as f:
             return f.read()
     return "No logs available."
 
 def list_pdfs():
-    """
-    Lists all downloaded PDFs.
-    """
     if os.path.exists(DOWNLOADED_PDFS_DIR):
         pdf_files = sorted(os.listdir(DOWNLOADED_PDFS_DIR))
         st.session_state['pdf_list'] = pdf_files
@@ -134,9 +202,6 @@ def list_pdfs():
     return []
 
 def get_base64_encoded_image(image_path):
-    """
-    Encodes an image to base64 for embedding in HTML/CSS.
-    """
     if not os.path.exists(image_path):
         return ""
     with open(image_path, 'rb') as img_file:
@@ -144,9 +209,6 @@ def get_base64_encoded_image(image_path):
     return encoded
 
 def create_zip_file():
-    """
-    Creates a ZIP file of all downloaded PDFs.
-    """
     zip_filename = "downloaded_pdfs.zip"
     with zipfile.ZipFile(zip_filename, 'w') as zipf:
         for pdf_file in st.session_state.get('pdf_list', []):
@@ -154,56 +216,28 @@ def create_zip_file():
     return zip_filename
 
 def validate_url(url):
-    """
-    Validates the entered URL.
-    """
     try:
         result = urlparse(url)
         return all([result.scheme, result.netloc])
-    except:
+    except Exception:
         return False
 
 def cleanup_on_start():
-    """
-    Cleans up any existing crawler processes when the app starts.
-    """
-    # Stop any running crawler
+    # Stop any running crawler from previous sessions
     if os.path.exists(PID_FILE):
         try:
             with open(PID_FILE, 'r') as f:
-                pid = int(f.read())
+                pid = int(f.read().strip())
             if psutil.pid_exists(pid):
-                process = psutil.Process(pid)
-                process.terminate()
-                try:
-                    process.wait(timeout=5)
-                    print(f"Stopped existing crawler process with PID {pid}.")
-                except psutil.TimeoutExpired:
-                    process.kill()
-                    print(f"Killed unresponsive crawler process with PID {pid}.")
-            else:
-                print(f"No process with PID {pid} found. Removing PID file.")
+                _kill_process_group(pid, timeout=5.0)
+        except Exception:
+            pass
+        try:
             os.remove(PID_FILE)
-        except Exception as e:
-            print(f"Error stopping existing crawler: {e}")
-            if os.path.exists(PID_FILE):
-                os.remove(PID_FILE)
-    # Check for any pdf_crawler.py processes without a PID file
-    for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
-        cmdline = proc.info.get('cmdline')
-        if cmdline and isinstance(cmdline, list):
-            cmdline_str = ' '.join(cmdline)
-            if 'pdf_crawler.py' in cmdline_str:
-                try:
-                    proc.terminate()
-                    proc.wait(timeout=5)
-                    print(f"Terminated rogue pdf_crawler.py process with PID {proc.info['pid']}.")
-                except psutil.TimeoutExpired:
-                    proc.kill()
-                    print(f"Killed unresponsive pdf_crawler.py process with PID {proc.info['pid']}.")
-                except Exception as e:
-                    print(f"Error stopping process with PID {proc.info['pid']}: {e}")
-    # Delete PDFs and logs
+        except Exception:
+            pass
+
+    # Fresh start
     if os.path.exists(LOG_FILE):
         os.remove(LOG_FILE)
     if os.path.exists(DOWNLOADED_PDFS_DIR):
@@ -212,37 +246,37 @@ def cleanup_on_start():
     st.session_state['pdf_list'] = []
 
 def cleanup_on_exit():
-    """
-    Cleans up any existing crawler processes when the app exits.
-    """
-    stop_crawler()
-    # Clear logs and PDFs on exit
-    if os.path.exists(LOG_FILE):
-        os.remove(LOG_FILE)
-    if os.path.exists(DOWNLOADED_PDFS_DIR):
-        shutil.rmtree(DOWNLOADED_PDFS_DIR)
+    # Try to stop any running crawler on app shutdown
+    if os.path.exists(PID_FILE):
+        try:
+            with open(PID_FILE, 'r') as f:
+                pid = int(f.read().strip())
+            if psutil.pid_exists(pid):
+                _kill_process_group(pid, timeout=3.0)
+        except Exception:
+            pass
+        try:
+            os.remove(PID_FILE)
+        except Exception:
+            pass
 
 atexit.register(cleanup_on_exit)
 
 # ----------------------------- Streamlit Interface -----------------------------
 
 def main():
-    # Perform cleanup only once when the app starts
     if not st.session_state['app_initialized']:
         cleanup_on_start()
         st.session_state['app_initialized'] = True
 
-    # Auto-refresh every 5 seconds to ensure the UI stays updated
     st_autorefresh(interval=5000, limit=None, key="auto_refresh")
 
-    # Apply custom CSS for background and chat bubbles
     background = get_base64_encoded_image('background.png')
-    logo = get_base64_encoded_image('tyrone-logo.png')  # Adjust to your logo file name
+    logo = get_base64_encoded_image('tyrone-logo.png')
 
     st.markdown(
         f"""
         <style>
-        /* Background image */
         .stApp {{
             background-image: url("data:image/png;base64,{background}");
             background-size: cover;
@@ -250,7 +284,6 @@ def main():
             background-attachment: fixed;
             background-position: center;
         }}
-        /* Custom styles */
         .chat-bubble {{
             background: rgba(255, 255, 255, 0.9);
             border-radius: 10px;
@@ -263,79 +296,100 @@ def main():
             font-family: monospace;
             font-size: 14px;
         }}
-        .logo {{
-            text-align: center;
-            margin-bottom: 20px;
-        }}
-        .logo img {{
-            max-width: 200px;
-        }}
+        .logo {{ text-align: center; margin-bottom: 20px; }}
+        .logo img {{ max-width: 200px; }}
         .footer {{
-            position: fixed;
-            left: 0;
-            bottom: 0;
-            width: 100%;
-            text-align: center;
-            color: #999999;
-            font-size: 12px;
-            padding: 10px;
+            position: fixed; left: 0; bottom: 0; width: 100%;
+            text-align: center; color: #999999; font-size: 12px; padding: 10px;
         }}
         </style>
         """,
         unsafe_allow_html=True
     )
 
-    # Display logo
     if logo:
-        st.markdown(
-            f"""
-            <div class="logo">
-                <img src="data:image/png;base64,{logo}" alt="Logo">
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
+        st.markdown(f"""<div class="logo"><img src="data:image/png;base64,{logo}" alt="Logo"></div>""", unsafe_allow_html=True)
     else:
-        st.markdown(
-            """
-            <div class="logo">
-                <h2>Universal PDF Crawler</h2>
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
+        st.markdown("""<div class="logo"><h2>Universal PDF Crawler</h2></div>""", unsafe_allow_html=True)
 
-    # Title
     st.markdown("<h1 style='text-align: center;'>📂 Universal PDF Crawler</h1>", unsafe_allow_html=True)
 
-    # Sidebar for input and controls
+    # Sidebar
     st.sidebar.header("🛠 Controls")
-    url_input = st.sidebar.text_input("Enter Website URL to Crawl:", value="", placeholder="https://www.example.com")
+    url_input = st.sidebar.text_input("Enter Website URL:", value="", placeholder="https://etenders.kerala.gov.in/...")
 
-    # Determine if crawler is running
+    st.sidebar.markdown("### Scope")
+    scope = st.sidebar.radio(
+        "Where should we look?",
+        options=["page", "host", "domain"],
+        index=0,
+        help="page = only this URL (but will peek into visible tender detail links)\nhost = this subdomain only\ndomain = *.example.com"
+    )
+
+    st.sidebar.markdown("### Rendering")
+    render_mode = st.sidebar.radio(
+        "Use headless browser?",
+        options=["auto", "always", "never"],
+        index=0,
+        help="auto: try requests first; if nothing useful is found, fall back to Selenium."
+    )
+
+    with st.sidebar.expander("Advanced limits"):
+        max_pages = st.number_input("Max pages to crawl", min_value=1, max_value=10000, value=100, step=10)
+        max_pdfs = st.number_input("Max PDFs to download", min_value=1, max_value=10000, value=200, step=10)
+        delay_s   = st.number_input("Delay between requests (seconds)", min_value=0.0, max_value=10.0, value=0.5, step=0.1)
+        obey_robots = st.checkbox("Respect robots.txt", value=True)
+
+    st.sidebar.markdown("---")
+
+    # Utility actions
+    c1, c2 = st.sidebar.columns(2)
+    if c1.button("Clear Downloads 🧹"):
+        if os.path.exists(DOWNLOADED_PDFS_DIR):
+            shutil.rmtree(DOWNLOADED_PDFS_DIR)
+        st.session_state['pdf_list'] = []
+        st.sidebar.success("Cleared downloaded PDFs.")
+        try:
+            st.rerun()
+        except Exception:
+            st.experimental_rerun()
+
+    if c2.button("Clear Logs 📝"):
+        if os.path.exists(LOG_FILE):
+            os.remove(LOG_FILE)
+        st.sidebar.success("Cleared logs.")
+        try:
+            st.rerun()
+        except Exception:
+            st.experimental_rerun()
+
     crawler_running = is_crawler_running()
     st.session_state['is_crawling'] = crawler_running
 
-    # Toggle Start/Stop Button
+    # Start/Stop
     if not crawler_running:
-        toggle_button_label = "Start Crawling 🔍"
-        if st.sidebar.button(toggle_button_label):
+        if st.sidebar.button("Start Crawling 🔍"):
             if url_input.strip() == "":
                 st.sidebar.error("Please enter a valid URL to start crawling.")
             elif not validate_url(url_input):
                 st.sidebar.error("Invalid URL. Please enter a valid URL.")
             else:
-                # Start the crawler
-                start_crawler(url_input)
+                start_crawler(
+                    url=url_input.strip(),
+                    scope=scope,
+                    render_mode=render_mode,
+                    max_pages=int(max_pages),
+                    max_pdfs=int(max_pdfs),
+                    delay_s=float(delay_s),
+                    obey_robots=obey_robots
+                )
     else:
-        toggle_button_label = "Stop Crawling 🛑"
-        if st.sidebar.button(toggle_button_label):
+        if st.sidebar.button("Stop Crawling 🛑"):
             stop_crawler()
 
-    st.sidebar.markdown("---")
-    st.sidebar.write(f"**Crawl Count:** {st.session_state.get('crawl_count', 0)}")
+    st.sidebar.markdown(f"**Crawl Count:** {st.session_state.get('crawl_count', 0)}")
 
-    # Main area with tabs
+    # Tabs
     tabs = st.tabs(["Home", "Downloaded PDFs", "Logs"])
 
     with tabs[0]:
@@ -344,82 +398,57 @@ def main():
         progress_bar = st.progress(0)
         log_content = read_log()
         if crawler_running:
-            # Attempt to read the PID and confirm if it's running
             try:
                 with open(PID_FILE, 'r') as f:
-                    pid = int(f.read())
+                    pid = int(f.read().strip())
                 status = f"Crawling in progress. Process PID: {pid}"
-            except:
+            except Exception:
                 status = "Crawling in progress."
             status_display.info(status)
-            # Update progress bar (simulate progress)
             progress_bar.progress(random.randint(0, 100))
         else:
             if "Crawling completed successfully." in log_content:
-                status = "Crawling completed successfully."
-                status_display.success(status)
+                status_display.success("Crawling completed successfully.")
             elif "Crawling has been stopped by the user." in log_content:
-                status = "Crawling stopped by user."
-                status_display.warning(status)
+                status_display.warning("Crawling stopped by user.")
             else:
-                status = "Idle"
-                status_display.info(status)
+                status_display.info("Idle")
             progress_bar.empty()
 
     with tabs[1]:
         st.header("📄 Downloaded PDFs")
         pdf_list = list_pdfs()
         if pdf_list:
-            pdf_links = []
-            for pdf in pdf_list:
-                pdf_path = os.path.join(DOWNLOADED_PDFS_DIR, pdf)
-                with open(pdf_path, "rb") as f:
-                    pdf_data = f.read()
-                b64 = base64.b64encode(pdf_data).decode()
-                href = f'<a href="data:application/octet-stream;base64,{b64}" download="{pdf}">{pdf}</a>'
-                pdf_links.append(href)
-            pdf_html = "<br>".join(pdf_links)
-            st.markdown(
-                f"""
-                <div class="chat-bubble">
-                {pdf_html}
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
-            # Download all PDFs as ZIP
-            zip_filename = create_zip_file()
-            with open(zip_filename, "rb") as f:
-                btn = st.download_button(
-                    label="Download All PDFs 📥",
-                    data=f,
-                    file_name=zip_filename,
-                    mime="application/zip"
-                )
+            q = st.text_input("Filter by filename:", value="")
+            show = [p for p in pdf_list if q.lower() in p.lower()]
+            if not show:
+                st.info("No matching PDFs.")
+            else:
+                links = []
+                for pdf in show:
+                    pdf_path = os.path.join(DOWNLOADED_PDFS_DIR, pdf)
+                    with open(pdf_path, "rb") as f:
+                        b64 = base64.b64encode(f.read()).decode()
+                    href = f'<a href="data:application/octet-stream;base64,{b64}" download="{pdf}">{pdf}</a>'
+                    links.append(href)
+                st.markdown(f'<div class="chat-bubble">{"<br>".join(links)}</div>', unsafe_allow_html=True)
+                zip_filename = create_zip_file()
+                with open(zip_filename, "rb") as f:
+                    st.download_button(
+                        label="Download All PDFs 📥",
+                        data=f,
+                        file_name=zip_filename,
+                        mime="application/zip"
+                    )
         else:
             st.info("No PDFs downloaded yet.")
 
     with tabs[2]:
         st.header("📝 Logs")
         log_content = read_log()
-        st.markdown(
-            f"""
-            <div class="chat-bubble">
-                <pre>{log_content}</pre>
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
+        st.markdown(f"<div class='chat-bubble'><pre>{log_content}</pre></div>", unsafe_allow_html=True)
 
-    # Footer
-    st.markdown(
-        """
-        <div class="footer">
-            Developed with ❤️ using Streamlit
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
+    st.markdown("<div class='footer'>Developed with ❤️ using Streamlit</div>", unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
